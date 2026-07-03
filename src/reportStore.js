@@ -1,5 +1,7 @@
 export const BROKERS = ["全部", "中信证券", "华泰证券", "国泰君安", "广发证券", "招商证券", "申万宏源"];
 export const RATINGS = ["全部", "强烈推荐", "超配", "买入", "增持", "中性", "减持"];
+export const RISKS = ["全部", "低", "中", "高"];
+export const ANALYSTS = ["全部", "陈晨", "王敏", "李想", "赵一鸣", "周宁", "孙悦", "黄璐", "刘远"];
 export const ORDER_FIELDS = ["date", "rating", "score", "readCount"];
 export const DIRECTIONS = ["asc", "desc"];
 export const PAGE_SIZES = [10, 20, 50];
@@ -73,8 +75,8 @@ export function resolveSecondaryTermHint(term = "") {
 
 const brokerCycle = BROKERS.filter((item) => item !== "全部");
 const ratingCycle = RATINGS.filter((item) => item !== "全部");
-const riskCycle = ["低", "中", "高"];
-const analystCycle = ["陈晨", "王敏", "李想", "赵一鸣", "周宁", "孙悦", "黄璐", "刘远"];
+const riskCycle = RISKS.filter((item) => item !== "全部");
+const analystCycle = ANALYSTS.filter((item) => item !== "全部");
 
 // 用模板批量生成更接近真实业务的标题，便于测试关键词、分类和排序组合。
 const titleTemplates = {
@@ -199,10 +201,18 @@ export function normalizeFilter(input = {}) {
     keyword: typeof input.keyword === "string" ? input.keyword : "",
     broker: BROKERS.includes(input.broker) ? input.broker : "全部",
     rating: RATINGS.includes(input.rating) ? input.rating : "全部",
+    risk: RISKS.includes(input.risk) ? input.risk : "全部",
+    analyst: ANALYSTS.includes(input.analyst) ? input.analyst : "全部",
     primaryCategory,
     secondaryCategory,
     dateFrom: typeof input.dateFrom === "string" ? input.dateFrom : "",
     dateTo: typeof input.dateTo === "string" ? input.dateTo : "",
+    scoreMin:
+      input.scoreMin === "" || input.scoreMin == null || !Number.isFinite(Number(input.scoreMin)) ? "" : Number(input.scoreMin),
+    readCountMin:
+      input.readCountMin === "" || input.readCountMin == null || !Number.isFinite(Number(input.readCountMin))
+        ? ""
+        : Number(input.readCountMin),
     orderBy: ORDER_FIELDS.includes(input.orderBy) ? input.orderBy : "date",
     direction: DIRECTIONS.includes(input.direction) ? input.direction : "desc",
     page: Number.isInteger(input.page) && input.page > 0 ? input.page : 1,
@@ -218,10 +228,14 @@ export function queryReports(filter) {
     keyword,
     broker,
     rating,
+    risk,
+    analyst,
     primaryCategory,
     secondaryCategory,
     dateFrom,
     dateTo,
+    scoreMin,
+    readCountMin,
     orderBy,
     direction,
     page,
@@ -232,10 +246,14 @@ export function queryReports(filter) {
   let rows = REPORTS.filter((report) => {
     if (broker !== "全部" && report.broker !== broker) return false;
     if (rating !== "全部" && report.rating !== rating) return false;
+    if (risk !== "全部" && report.risk !== risk) return false;
+    if (analyst !== "全部" && report.analyst !== analyst) return false;
     if (primaryCategory !== "全部" && report.primaryCategory !== primaryCategory) return false;
     if (secondaryCategory !== "全部" && report.secondaryCategory !== secondaryCategory) return false;
     if (dateFrom && report.date < dateFrom) return false;
     if (dateTo && report.date > dateTo) return false;
+    if (Number.isFinite(scoreMin) && report.score < scoreMin) return false;
+    if (Number.isFinite(readCountMin) && report.readCount < readCountMin) return false;
     if (!normalizedKeyword) return true;
 
     return [

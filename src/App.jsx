@@ -1,13 +1,22 @@
 import { useMemo, useRef, useState } from "react";
-import { CopilotPopup, useAgentContext, useDefaultRenderTool, useFrontendTool } from "@copilotkit/react-core/v2";
+import {
+  CopilotPopup,
+  UseAgentUpdate,
+  useAgent,
+  useAgentContext,
+  useDefaultRenderTool,
+  useFrontendTool,
+} from "@copilotkit/react-core/v2";
 import { z } from "zod";
 import {
   BROKERS,
+  ANALYSTS,
   DIRECTIONS,
   ORDER_FIELDS,
   PAGE_SIZES,
   PRIMARY_OPTIONS,
   RATINGS,
+  RISKS,
   delay,
   getSecondaryOptions,
   normalizeFilter,
@@ -21,10 +30,14 @@ const defaultFilter = normalizeFilter({
   keyword: "",
   broker: "全部",
   rating: "全部",
+  risk: "全部",
+  analyst: "全部",
   primaryCategory: "全部",
   secondaryCategory: "全部",
   dateFrom: "",
   dateTo: "",
+  scoreMin: "",
+  readCountMin: "",
   orderBy: "date",
   direction: "desc",
   page: 1,
@@ -43,6 +56,8 @@ const ratingClass = {
 const primaryEnum = z.enum(PRIMARY_OPTIONS);
 const brokerEnum = z.enum(BROKERS);
 const ratingEnum = z.enum(RATINGS);
+const riskEnum = z.enum(RISKS);
+const analystEnum = z.enum(ANALYSTS);
 const orderFieldEnum = z.enum(ORDER_FIELDS);
 const directionEnum = z.enum(DIRECTIONS);
 
@@ -83,14 +98,96 @@ export default function App() {
   const selectedIdsRef = useRef([]);
   const [activeReportId, setActiveReportId] = useState(initialResult.rows[0]?.id || null);
   const [activity, setActivity] = useState(["初始化加载：展示全部研报前 10 条"]);
+  const initialOperationLogRef = useRef([
+    {
+      id: "op-init",
+      actor: "system",
+      type: "loadReports",
+      status: "completed",
+      summary: "初始化加载：展示全部研报前 10 条",
+      payload: { total: initialResult.total, page: initialResult.page },
+      createdAt: new Date().toISOString(),
+    },
+  ]);
+  const operationLogRef = useRef(initialOperationLogRef.current);
+  const [operationLog, setOperationLog] = useState(initialOperationLogRef.current);
   const [copilotStarted, setCopilotStarted] = useState(false);
+  const { agent } = useAgent({
+    agentId: "report_agent",
+    updates: [UseAgentUpdate.OnRunStatusChanged],
+  });
+  const activeOperationRef = useRef(null);
+  const [activeOperation, setActiveOperation] = useState(null);
 
   const activeReport = reports.find((item) => item.id === activeReportId) || null;
+  const canInterrupt = agent.isRunning || Boolean(activeOperation);
   const showSecondaryFilter = filter.primaryCategory !== "全部";
 
-  // 页面操作流水只保留最近几条，用来观察 AI 和人工操作到底执行了什么。
-  function pushActivity(message) {
-    setActivity((items) => [message, ...items].slice(0, 8));
+  function formatOperationLog(entry) {
+    const actorName = {
+      ai: "AI",
+      user: "用户",
+      system: "系统",
+    }[entry.actor] || entry.actor;
+    const statusName = {
+      running: "开始",
+      completed: "完成",
+      failed: "失败",
+      interrupted: "打断",
+    }[entry.status] || entry.status;
+    return `${actorName} ${statusName}：${entry.summary}`;
+  }
+
+  function recordOperation({ actor = "system", type = "activity", status = "completed", summary, payload = {} }) {
+    const entry = {
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      actor,
+      type,
+      status,
+      summary,
+      payload,
+      createdAt: new Date().toISOString(),
+    };
+    const nextLog = [entry, ...operationLogRef.current].slice(0, 40);
+    operationLogRef.current = nextLog;
+    setOperationLog(nextLog);
+    setActivity(nextLog.slice(0, 10).map(formatOperationLog));
+    return entry;
+  }
+
+  // 页面操作流水同时服务 UI 审计和 Copilot 上下文，避免 AI 只靠对话历史猜测用户做过什么。
+  function pushActivity(message, metadata = {}) {
+    recordOperation({ summary: message, ...metadata });
+  }
+
+  function startTrackedOperation(label) {
+    const operation = {
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      label,
+      startedAt: Date.now(),
+    };
+
+    activeOperationRef.current = operation;
+    setActiveOperation({ id: operation.id, label, startedAt: operation.startedAt });
+
+    return {
+      finish: () => {
+        if (activeOperationRef.current?.id === operation.id) {
+          activeOperationRef.current = null;
+          setActiveOperation(null);
+        }
+      },
+    };
+  }
+
+  function interruptCurrentOperation() {
+    if (agent.isRunning) agent.abortRun();
+    pushActivity("打断 AI 后续操作，已发出的前端请求继续完成", {
+      actor: "user",
+      type: "interruptAgentRun",
+      status: "interrupted",
+      payload: { activeOperation: activeOperationRef.current?.label || null },
+    });
   }
 
   function setCurrentFilter(nextFilter) {
@@ -104,14 +201,29 @@ export default function App() {
   async function fetchSecondaryOptions(primaryCategory, reason = "用户切换一级筛选", options = {}) {
     const safePrimary = PRIMARY_OPTIONS.includes(primaryCategory) ? primaryCategory : "全部";
     const simulateRequestCase = options.simulateRequestCase || "normal";
+    const actor = options.actor || "system";
+    const operation = startTrackedOperation(`二级筛选接口：${safePrimary}`);
     setSecondaryLoading(true);
-    pushActivity(`请求二级筛选接口：一级=${safePrimary}${reason ? `，原因=${reason}` : ""}`);
+    pushActivity(`请求二级筛选接口：一级=${safePrimary}${reason ? `，原因=${reason}` : ""}`, {
+      actor,
+      type: "loadSecondaryOptions",
+      status: "running",
+      payload: { primaryCategory: safePrimary, reason },
+    });
 
     try {
       for (let attempt = 1; attempt <= 2; attempt += 1) {
         try {
-          pushActivity(`等待二级筛选接口返回：第 ${attempt} 次请求`);
-          const nextOptions = await requestSecondaryOptions(safePrimary, { attempt, simulateRequestCase });
+          pushActivity(`等待二级筛选接口返回：第 ${attempt} 次请求`, {
+            actor: "system",
+            type: "secondaryOptionsRequest",
+            status: "running",
+            payload: { primaryCategory: safePrimary, attempt },
+          });
+          const nextOptions = await requestSecondaryOptions(safePrimary, {
+            attempt,
+            simulateRequestCase,
+          });
           secondaryOptionsRef.current = nextOptions;
           setSecondaryOptions(nextOptions);
 
@@ -125,7 +237,12 @@ export default function App() {
             });
           }
 
-          pushActivity(`二级筛选已加载：${nextOptions.join(" / ")}`);
+          pushActivity(`二级筛选已加载：${nextOptions.join(" / ")}`, {
+            actor: "system",
+            type: "secondaryOptionsRequest",
+            status: "completed",
+            payload: { primaryCategory: safePrimary, secondaryOptions: nextOptions, attempts: attempt },
+          });
           return {
             ok: true,
             primaryCategory: safePrimary,
@@ -135,11 +252,21 @@ export default function App() {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           if (attempt === 1) {
-            pushActivity(`二级筛选接口失败：${message}，自动重试一次`);
+            pushActivity(`二级筛选接口失败：${message}，自动重试一次`, {
+              actor: "system",
+              type: "secondaryOptionsRequest",
+              status: "failed",
+              payload: { primaryCategory: safePrimary, attempt, error: message, willRetry: true },
+            });
             continue;
           }
 
-          pushActivity(`二级筛选接口连续失败：${message}`);
+          pushActivity(`二级筛选接口连续失败：${message}`, {
+            actor: "system",
+            type: "secondaryOptionsRequest",
+            status: "failed",
+            payload: { primaryCategory: safePrimary, attempt, error: message, willRetry: false },
+          });
           return {
             ok: false,
             primaryCategory: safePrimary,
@@ -151,6 +278,7 @@ export default function App() {
       }
     } finally {
       setSecondaryLoading(false);
+      operation.finish();
     }
 
     return {
@@ -179,25 +307,49 @@ export default function App() {
   }
 
   // 所有入口都复用这一条加载链路：手动按钮、排序、翻页和 Copilot action。
-  async function loadReportsWithCurrentFilter(reason = "刷新列表") {
+  async function loadReportsWithCurrentFilter(reason = "刷新列表", options = {}) {
+    const actor = options.actor || "system";
+    const operation = startTrackedOperation(`加载研报：${reason}`);
     setLoading(true);
-    pushActivity(`开始加载研报：${reason}`);
-    await delay(420);
-    const result = queryReports(filterRef.current);
-    applyQueryResult(result);
-    setLoading(false);
-    pushActivity(`加载完成：共 ${result.total} 条，当前第 ${result.page}/${result.totalPages} 页`);
-    return result;
+    pushActivity(`开始加载研报：${reason}`, {
+      actor,
+      type: "loadReports",
+      status: "running",
+      payload: { reason, filter: filterRef.current },
+    });
+
+    try {
+      await delay(420);
+      const result = queryReports(filterRef.current);
+      applyQueryResult(result);
+      pushActivity(`加载完成：共 ${result.total} 条，当前第 ${result.page}/${result.totalPages} 页`, {
+        actor: "system",
+        type: "loadReports",
+        status: "completed",
+        payload: { total: result.total, page: result.page, pageSize: result.pageSize, totalPages: result.totalPages },
+      });
+      return result;
+    } catch (error) {
+      throw error;
+    } finally {
+      setLoading(false);
+      operation.finish();
+    }
   }
 
   // 清空条件的业务语义是“回到全部数据”，所以会同时重置一级/二级筛选和分页。
-  async function clearFiltersAndLoad(reason = "清空条件后加载全部数据") {
+  async function clearFiltersAndLoad(reason = "清空条件后加载全部数据", options = {}) {
     const defaultSecondaryOptions = getSecondaryOptions("全部");
     secondaryOptionsRef.current = defaultSecondaryOptions;
     setSecondaryOptions(defaultSecondaryOptions);
     setCurrentFilter(defaultFilter);
-    pushActivity("清空筛选条件");
-    return loadReportsWithCurrentFilter(reason);
+    pushActivity("清空筛选条件", {
+      actor: options.actor || "system",
+      type: "clearFilter",
+      status: "completed",
+      payload: { filter: defaultFilter },
+    });
+    return loadReportsWithCurrentFilter(reason, options);
   }
 
   // 暴露给 Copilot 的页面上下文。LLM 会根据这些状态理解“当前结果”“再按热度排”等相对指令。
@@ -223,6 +375,7 @@ export default function App() {
         title: item.title,
         broker: item.broker,
         rating: item.rating,
+        risk: item.risk,
         primaryCategory: item.primaryCategory,
         secondaryCategory: item.secondaryCategory,
         analyst: item.analyst,
@@ -232,6 +385,20 @@ export default function App() {
       })),
       selectedIds,
       activeReportId,
+      recentOperations: operationLog.slice(0, 20).map((entry) => ({
+        actor: entry.actor,
+        type: entry.type,
+        status: entry.status,
+        summary: entry.summary,
+        payload: entry.payload,
+        createdAt: entry.createdAt,
+      })),
+      interrupt: {
+        agentRunning: agent.isRunning,
+        localOperation: activeOperation?.label || null,
+        canInterrupt,
+        policy: "用户打断只停止 AI 继续输出和继续规划后续工具调用；已经发出的前端业务请求会继续完成，并照常更新共享页面状态。",
+      },
       requiredWorkflowForSecondaryFilter: [
         "先调用 resolveSecondaryFilterIntent 判断疑似二级词属于哪个一级方向，并追问用户确认",
         "用户确认后再调用 loadSecondaryFilterOptions，传入一级筛选 primaryCategory",
@@ -249,12 +416,25 @@ export default function App() {
         "选择并导出当前可见研报，导出前需要人工确认",
       ],
     }),
-    [activeReportId, filter, loading, pagination, reports, secondaryLoading, selectedIds, showSecondaryFilter],
+    [
+      activeOperation,
+      activeReportId,
+      agent.isRunning,
+      canInterrupt,
+      filter,
+      loading,
+      operationLog,
+      pagination,
+      reports,
+      secondaryLoading,
+      selectedIds,
+      showSecondaryFilter,
+    ],
   );
 
   useAgentContext({
     description:
-      "研报工作台当前状态。注意：如果用户提到疑似二级筛选，例如新能源、半导体、主动权益、利率债、可转债，不能直接确认二级值；必须先调用 resolveSecondaryFilterIntent 生成金融语义判断和追问，等用户确认后，再调用 loadSecondaryFilterOptions 模拟接口请求二级候选项，最后才能 setReportFilter 和 loadReports。",
+      "研报工作台当前状态。recentOperations 是用户、AI 和系统请求的结构化操作日志，回答“刚才做了什么”时必须优先依据它。注意：如果用户提到疑似二级筛选，例如新能源、半导体、主动权益、利率债、可转债，不能直接确认二级值；必须先调用 resolveSecondaryFilterIntent 生成金融语义判断和追问，等用户确认后，再调用 loadSecondaryFilterOptions 模拟接口请求二级候选项，最后才能 setReportFilter 和 loadReports。",
     value: contextValue,
   });
 
@@ -283,7 +463,12 @@ export default function App() {
     }),
     handler: async ({ term }) => {
       const result = resolveSecondaryTermHint(term);
-      pushActivity(`识别疑似二级筛选：${term}`);
+      pushActivity(`识别疑似二级筛选：${term}`, {
+        actor: "ai",
+        type: "resolveSecondaryFilterIntent",
+        status: "completed",
+        payload: { term, result },
+      });
       return {
         ...result,
         rule: "二级筛选必须先追问用户确认；确认后再调用 loadSecondaryFilterOptions 请求候选项，然后 setReportFilter 时传 secondaryConfirmedByUser=true。",
@@ -307,6 +492,7 @@ export default function App() {
     handler: async ({ primaryCategory, reason, simulateRequestCase = "normal" }) => {
       const result = await fetchSecondaryOptions(primaryCategory, reason || "AI 需要二级筛选候选项", {
         simulateRequestCase,
+        actor: "ai",
       });
       if (!result.ok) {
         return {
@@ -337,6 +523,8 @@ export default function App() {
       keyword: z.string().optional().describe("关键词，例如 储能、AI、ETF、利率。空字符串表示不按关键词筛选。"),
       broker: brokerEnum.optional().describe("券商筛选。"),
       rating: ratingEnum.optional().describe("评级筛选。"),
+      risk: riskEnum.optional().describe("风险等级筛选：全部、低、中、高。"),
+      analyst: analystEnum.optional().describe("分析师筛选。"),
       primaryCategory: primaryEnum.optional().describe("一级筛选。切换一级筛选后建议先调用 loadSecondaryFilterOptions。"),
       secondaryCategory: z.string().optional().describe("二级筛选，必须是当前一级筛选返回的候选项。"),
       secondaryConfirmedByUser: z
@@ -345,6 +533,8 @@ export default function App() {
         .describe("只有用户已经明确确认要按该二级方向筛选时才传 true。没有确认时禁止设置具体二级筛选。"),
       dateFrom: z.string().optional().describe("开始日期，格式 YYYY-MM-DD。"),
       dateTo: z.string().optional().describe("结束日期，格式 YYYY-MM-DD。"),
+      scoreMin: z.union([z.number(), z.string()]).optional().describe("最低内部分数。"),
+      readCountMin: z.union([z.number(), z.string()]).optional().describe("最低热度/阅读量。"),
       orderBy: orderFieldEnum.optional().describe("排序字段：date/rating/score/readCount。"),
       direction: directionEnum.optional().describe("排序方向：asc 升序，desc 降序。"),
       page: z.number().int().positive().optional().describe("页码，从 1 开始。"),
@@ -380,7 +570,12 @@ export default function App() {
         page: params.page || 1,
       });
 
-      pushActivity(`更新筛选条件：${JSON.stringify(nextFilter)}`);
+      pushActivity(`更新筛选条件：${JSON.stringify(nextFilter)}`, {
+        actor: "ai",
+        type: "setReportFilter",
+        status: "completed",
+        payload: { filter: nextFilter },
+      });
       return `筛选条件已更新为 ${JSON.stringify(nextFilter)}`;
     },
   });
@@ -393,7 +588,7 @@ export default function App() {
       reason: z.string().optional().describe("本次加载原因，便于审计展示。"),
     }),
     handler: async ({ reason }) => {
-      const result = await loadReportsWithCurrentFilter(reason || "AI 请求刷新列表");
+      const result = await loadReportsWithCurrentFilter(reason || "AI 请求刷新列表", { actor: "ai" });
       return `已加载 ${result.rows.length} 条当前页数据，总计 ${result.total} 条。`;
     },
   });
@@ -404,7 +599,7 @@ export default function App() {
     description: "清空所有筛选条件，并恢复默认按日期降序、第 1 页、每页 10 条，然后加载全部研报数据。",
     parameters: z.object({}),
     handler: async () => {
-      const result = await clearFiltersAndLoad("AI 清空条件后加载全部数据");
+      const result = await clearFiltersAndLoad("AI 清空条件后加载全部数据", { actor: "ai" });
       return `筛选条件已清空，已加载全部研报数据，总计 ${result.total} 条。`;
     },
   });
@@ -422,7 +617,12 @@ export default function App() {
       const target = reportId ? currentReports.find((item) => item.id === reportId) : currentReports[(position || 1) - 1];
       if (!target) return "没有找到对应研报，请先加载列表或换一个序号。";
       setActiveReportId(target.id);
-      pushActivity(`打开详情：${target.title}`);
+      pushActivity(`打开详情：${target.title}`, {
+        actor: "ai",
+        type: "openReportDetail",
+        status: "completed",
+        payload: { reportId: target.id, title: target.title },
+      });
       return `已打开「${target.title}」`;
     },
   });
@@ -441,7 +641,12 @@ export default function App() {
       const validIds = ids.filter((id) => currentReports.some((item) => item.id === id));
       selectedIdsRef.current = validIds;
       setSelectedIds(validIds);
-      pushActivity(`选中 ${validIds.length} 篇研报`);
+      pushActivity(`选中 ${validIds.length} 篇研报`, {
+        actor: "ai",
+        type: "selectReports",
+        status: "completed",
+        payload: { mode, reportIds: validIds },
+      });
       return `已选中 ${validIds.length} 篇研报`;
     },
   });
@@ -461,7 +666,12 @@ export default function App() {
       const ok = window.confirm(`确认导出 ${selectedReports.length} 篇研报为 ${format.toUpperCase()} 吗？`);
       if (!ok) return "用户取消导出。";
       downloadReportTableCsv(selectedReports, makeReportCsvFilename("选中项"));
-      pushActivity(`已确认导出：${selectedReports.length} 篇，格式 ${format}`);
+      pushActivity(`已确认导出：${selectedReports.length} 篇，格式 ${format}`, {
+        actor: "ai",
+        type: "exportSelectedReports",
+        status: "completed",
+        payload: { format, count: selectedReports.length },
+      });
       return `已导出 ${selectedReports.length} 篇研报为 ${format.toUpperCase()}。`;
     },
   });
@@ -477,28 +687,39 @@ export default function App() {
       const currentReports = reportsRef.current;
       if (currentReports.length === 0) return "当前页面没有可导出的研报。";
       downloadReportTableCsv(currentReports, makeReportCsvFilename("当前页"));
-      pushActivity(`AI 导出当前页面表格：${currentReports.length} 条，格式 ${format}`);
+      pushActivity(`AI 导出当前页面表格：${currentReports.length} 条，格式 ${format}`, {
+        actor: "ai",
+        type: "exportVisibleReports",
+        status: "completed",
+        payload: { format, count: currentReports.length },
+      });
       return `已导出当前页面 ${currentReports.length} 条研报为 ${format.toUpperCase()}。`;
     },
   });
 
   // 手动切换一级筛选时只加载二级候选项，不自动查表，用户可以继续补充其他条件后再加载。
   async function updatePrimaryCategory(value) {
-    await fetchSecondaryOptions(value, "手动切换一级筛选");
+    await fetchSecondaryOptions(value, "手动切换一级筛选", { actor: "user" });
   }
 
   // 所有筛选控件共用的更新函数。除翻页外，任何条件变化都会回到第一页。
   function updateFilterField(key, value) {
     const nextValue = key === "pageSize" ? Number(value) : value;
-    setCurrentFilter({ ...filterRef.current, [key]: nextValue, page: key === "page" ? Number(value) : 1 });
+    const nextFilter = setCurrentFilter({ ...filterRef.current, [key]: nextValue, page: key === "page" ? Number(value) : 1 });
+    pushActivity(`手动更新筛选字段：${key}=${nextValue}`, {
+      actor: "user",
+      type: "setFilterField",
+      status: "completed",
+      payload: { key, value: nextValue, filter: nextFilter },
+    });
   }
 
   async function loadManually() {
-    await loadReportsWithCurrentFilter("手动加载");
+    await loadReportsWithCurrentFilter("手动加载", { actor: "user" });
   }
 
   async function clearManually() {
-    await clearFiltersAndLoad("手动清空后加载全部数据");
+    await clearFiltersAndLoad("手动清空后加载全部数据", { actor: "user" });
   }
 
   // 导出动作复用同一套 CSV 生成逻辑，避免手动导出和 AI 导出字段不一致。
@@ -528,24 +749,39 @@ export default function App() {
   function exportVisibleTable() {
     const currentReports = reportsRef.current;
     if (currentReports.length === 0) {
-      pushActivity("导出表格失败：当前表格无数据");
+      pushActivity("导出表格失败：当前表格无数据", {
+        actor: "user",
+        type: "exportVisibleReports",
+        status: "failed",
+        payload: { count: 0 },
+      });
       return;
     }
 
     downloadReportTableCsv(currentReports, makeReportCsvFilename());
-    pushActivity(`导出当前表格：${currentReports.length} 条`);
+    pushActivity(`导出当前表格：${currentReports.length} 条`, {
+      actor: "user",
+      type: "exportVisibleReports",
+      status: "completed",
+      payload: { count: currentReports.length },
+    });
   }
 
   async function goToPage(page) {
     setCurrentFilter({ ...filterRef.current, page });
-    await loadReportsWithCurrentFilter(`翻到第 ${page} 页`);
+    await loadReportsWithCurrentFilter(`翻到第 ${page} 页`, { actor: "user" });
   }
 
   function toggleSelected(id) {
-    setSelectedIds((ids) => {
-      const nextIds = ids.includes(id) ? ids.filter((item) => item !== id) : [...ids, id];
-      selectedIdsRef.current = nextIds;
-      return nextIds;
+    const wasSelected = selectedIdsRef.current.includes(id);
+    const nextIds = wasSelected ? selectedIdsRef.current.filter((item) => item !== id) : [...selectedIdsRef.current, id];
+    selectedIdsRef.current = nextIds;
+    setSelectedIds(nextIds);
+    pushActivity(`手动${wasSelected ? "取消选中" : "选中"}研报：${id}`, {
+      actor: "user",
+      type: "toggleReportSelection",
+      status: "completed",
+      payload: { reportId: id, selectedIds: nextIds },
     });
   }
 
@@ -553,7 +789,7 @@ export default function App() {
   async function sortByColumn(orderBy) {
     const direction = filter.orderBy === orderBy && filter.direction === "desc" ? "asc" : "desc";
     setCurrentFilter({ ...filterRef.current, orderBy, direction, page: 1 });
-    await loadReportsWithCurrentFilter(`按${orderBy}表头排序`);
+    await loadReportsWithCurrentFilter(`按${orderBy}表头排序`, { actor: "user" });
   }
 
   function renderSortLabel(orderBy) {
@@ -571,6 +807,18 @@ export default function App() {
           </div>
           <span className="runtime-pill">AG-UI Runtime</span>
         </div>
+
+        {canInterrupt && (
+          <section className="interrupt-strip" aria-live="polite">
+            <div>
+              <strong>{agent.isRunning ? "AI 正在执行" : "操作执行中"}</strong>
+              <span>{activeOperation?.label || "等待模型响应或工具返回"}</span>
+            </div>
+            <button type="button" onClick={interruptCurrentOperation}>
+              打断当前操作
+            </button>
+          </section>
+        )}
 
         <section className={`toolbar toolbar-advanced ${showSecondaryFilter ? "has-secondary" : "no-secondary"}`}>
           <label className="filter-keyword">
@@ -628,12 +876,53 @@ export default function App() {
             </select>
           </label>
           <label>
+            风险
+            <select value={filter.risk} onChange={(event) => updateFilterField("risk", event.target.value)}>
+              {RISKS.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            分析师
+            <select value={filter.analyst} onChange={(event) => updateFilterField("analyst", event.target.value)}>
+              {ANALYSTS.map((item) => (
+                <option key={item} value={item}>
+                  {item}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
             开始日期
             <input type="date" value={filter.dateFrom} onChange={(event) => updateFilterField("dateFrom", event.target.value)} />
           </label>
           <label>
             结束日期
             <input type="date" value={filter.dateTo} onChange={(event) => updateFilterField("dateTo", event.target.value)} />
+          </label>
+          <label>
+            最低评分
+            <input
+              type="number"
+              min="0"
+              max="100"
+              value={filter.scoreMin}
+              onChange={(event) => updateFilterField("scoreMin", event.target.value)}
+              placeholder="如 80"
+            />
+          </label>
+          <label>
+            最低热度
+            <input
+              type="number"
+              min="0"
+              value={filter.readCountMin}
+              onChange={(event) => updateFilterField("readCountMin", event.target.value)}
+              placeholder="如 5000"
+            />
           </label>
           <label>
             每页
@@ -725,7 +1014,18 @@ export default function App() {
                       </td>
                       <td>{report.date}</td>
                       <td>
-                        <button className="link-button" onClick={() => setActiveReportId(report.id)}>
+                        <button
+                          className="link-button"
+                          onClick={() => {
+                            setActiveReportId(report.id);
+                            pushActivity(`手动打开详情：${report.title}`, {
+                              actor: "user",
+                              type: "openReportDetail",
+                              status: "completed",
+                              payload: { reportId: report.id, title: report.title },
+                            });
+                          }}
+                        >
                           {(pagination.page - 1) * pagination.pageSize + index + 1}. {report.title}
                         </button>
                         <div className="row-subtitle">{report.analyst} · 风险{report.risk}</div>

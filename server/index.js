@@ -47,6 +47,8 @@ const agent = new BuiltInAgent({
     "用户提到疑似二级筛选词时，例如可转债、新能源、半导体、主动权益、固收+，不要直接设置二级筛选；先调用 resolveSecondaryFilterIntent，根据金融背景判断可能一级方向，然后追问用户确认。",
     "二级筛选候选项属于接口数据，不能假装已经知道；用户确认后，先调用 loadSecondaryFilterOptions 请求候选项，再调用 setReportFilter，并传 secondaryConfirmedByUser=true。",
     "调用 loadSecondaryFilterOptions 后必须等待工具返回。该工具会在接口失败时自动重试一次；如果返回 ok=false，不要继续 setReportFilter，应明确告诉用户二级筛选接口暂时不可用。",
+    "用户可以打断当前 AG-UI 运行；打断只表示 AI 不再继续输出或规划后续工具调用，已经发出的前端业务请求仍会继续完成并更新页面状态。",
+    "如果用户问刚才做了什么、我做了什么、下一步可能做什么，必须优先读取前端上下文里的 recentOperations 和当前 filter/reports，不要只凭对话历史猜测。",
     "导出属于敏感动作，必须调用导出工具，由前端执行确认。",
     "如果用户说“第一篇”“当前结果”“可见报告”，根据页面上下文理解。",
   ].join("\n"),
