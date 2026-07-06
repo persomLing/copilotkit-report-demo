@@ -25,9 +25,10 @@ Demo 里新增了 `src/memoryStore.js`：
 
 - `userMemory`：记录当前用户偏好、习惯和纠错，只影响当前用户。
 - `systemRules.candidates`：AI 从纠错中提炼出的待审核规则，不会自动生效。
-- `systemRules.approved`：人工批准后的通用规则，会通过 `useAgentContext` 提供给 AI。
+- `systemRules.approved`：人工批准后的通用规则，全量保存在规则库。
+- `retrieveRelevantRules`：按用户输入和模块召回 Top K 相关规则，再进入 `useAgentContext`，避免全量规则浪费 token。
 
-页面底部的“知识沉淀”面板可以查看已生效规则、待审核规则，并支持批准、驳回和重置。
+“知识沉淀”Tab 可以查看已生效规则、待审核规则、本轮召回规则，并支持批准、驳回和重置。
 
 ## 本地开发
 

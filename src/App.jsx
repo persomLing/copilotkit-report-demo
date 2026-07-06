@@ -34,6 +34,7 @@ import {
   forgetUserMemory,
   loadKnowledgeBase,
   recordLearningCase,
+  retrieveRelevantRules,
   resetKnowledgeBase,
   saveKnowledgeBase,
   summarizeKnowledgeForAgent,
@@ -127,6 +128,7 @@ export default function App() {
   const [operationLog, setOperationLog] = useState(initialOperationLogRef.current);
   const [knowledgeBase, setKnowledgeBase] = useState(() => loadKnowledgeBase());
   const knowledgeBaseRef = useRef(knowledgeBase);
+  const [activeRuleContext, setActiveRuleContext] = useState(null);
   const [copilotStarted, setCopilotStarted] = useState(false);
   const [activeTab, setActiveTab] = useState("workbench");
   const { agent } = useAgent({
@@ -189,6 +191,16 @@ export default function App() {
       payload,
     });
     return nextKnowledgeBase;
+  }
+
+  function refreshRelevantRules({ query, moduleId = "report", topK = 5 }) {
+    const result = retrieveRelevantRules(knowledgeBaseRef.current, { query, moduleId, topK });
+    setActiveRuleContext(result);
+    return result;
+  }
+
+  function looksReusableRuleText(text) {
+    return /以后|应该|优先|不要|不能|必须|规则|遇到|类似|优先级|先看|没有.*再/.test(text || "");
   }
 
   function startTrackedOperation(label) {
@@ -400,20 +412,13 @@ export default function App() {
       currentPage: pagination.page,
       totalPages: pagination.totalPages,
       visibleReportCount: reports.length,
-      visibleReports: reports.map((item, index) => ({
+      visibleReportRefs: reports.map((item, index) => ({
         position: index + 1,
         id: item.id,
         title: item.title,
-        broker: item.broker,
-        rating: item.rating,
-        risk: item.risk,
-        primaryCategory: item.primaryCategory,
-        secondaryCategory: item.secondaryCategory,
-        analyst: item.analyst,
-        score: item.score,
-        readCount: item.readCount,
-        date: item.date,
       })),
+      visibleReportContextPolicy:
+        "AI 上下文只提供当前页研报的 position/id/title，用于打开、选中、导出等定位操作；券商、评级、评分、热度、日期等完整字段只在左侧业务表格展示，禁止在 Copilot 对话区复刻表格。",
       selectedIds,
       activeReportId,
       recentOperations: operationLog.slice(0, 20).map((entry) => ({
@@ -430,7 +435,14 @@ export default function App() {
         canInterrupt,
         policy: "用户打断只停止 AI 继续输出和继续规划后续工具调用；已经发出的前端业务请求会继续完成，并照常更新共享页面状态。",
       },
-      learningMemory: summarizeKnowledgeForAgent(knowledgeBase),
+      responsePolicy: {
+        tableDisplay: "不要在 Copilot 对话中用 Markdown 表格复刻当前页数据；表格数据只在左侧研报工作台展示。",
+        afterLoad:
+          "筛选、排序、加载完成后，只回复简短摘要，例如“已按条件加载，共 N 条，当前第 X/Y 页”；不要列出每条报告。",
+        whenUserAsksList:
+          "只有用户明确要求在对话里列出结果时，最多用 3 条简短项目符号展示，不要输出完整表格。",
+      },
+      learningMemory: summarizeKnowledgeForAgent(knowledgeBase, activeRuleContext),
       requiredWorkflowForSecondaryFilter: [
         "筛选类自然语言优先调用 resolveReportFilterIntent 解析整体意图；返回 execute 直接执行，execute_with_note 先执行并说明假设，clarify 才追问",
         "不要因为出现疑似二级词就默认追问；对可撤销的筛选动作，中置信度应先执行再允许用户纠正",
@@ -456,6 +468,7 @@ export default function App() {
     [
       activeOperation,
       activeReportId,
+      activeRuleContext,
       agent.isRunning,
       canInterrupt,
       filter,
@@ -472,7 +485,7 @@ export default function App() {
 
   useAgentContext({
     description:
-      "研报工作台当前状态。recentOperations 是用户、AI 和系统请求的结构化操作日志，回答“刚才做了什么”时必须优先依据它。learningMemory 中 userPreferences/userCorrections/userHabits 是当前用户记忆，只作为个人偏好参考；approvedSystemRules 是可执行的通用规则；pendingRuleCandidates 只能提示人工审核，不能当事实执行。筛选类自然语言优先调用 resolveReportFilterIntent 解析整体意图；返回 execute 直接执行，execute_with_note 先执行并说明假设，clarify 才追问。不要因为出现疑似二级词就默认追问；对筛选、排序、关键词检索这类可撤销动作，中置信度应先执行再允许用户纠正。注意：如果用户说“半导体相关的基金”“新能源相关基金”“AI 主题基金”，基金优先表示一级分类=基金研究，行业/主题词作为 keyword，不要按股票研究二级筛选追问；如果用户说评分不低于、评分至少、80分以上，使用 scoreMin 参数。若用户同一句话已经明确指定一级分类并要求先加载该一级的二级筛选，再指定二级值，例如“先加载股票研究的二级筛选，再只看电力设备”，则视为用户已确认二级筛选意图，不要再次追问；应先调用 loadSecondaryFilterOptions，等待接口返回候选项，确认包含该二级值后再 setReportFilter，并传 secondaryConfirmedByUser=true，最后 loadReports。用户明确纠错或表达偏好时，调用 recordLearningCase、recordUserMemory 或 proposeSystemRule 沉淀经验。",
+      "研报工作台当前状态。recentOperations 是用户、AI 和系统请求的结构化操作日志，回答“刚才做了什么”时必须优先依据它。visibleReportRefs 只提供当前页研报的 position/id/title，用于打开详情、选择或导出定位；不要在聊天回复里用 Markdown 表格复刻当前页数据，券商、评级、评分、热度、日期等完整字段以左侧业务表格为准；筛选、排序、加载完成后只回复简短摘要。learningMemory 中 userPreferences/userCorrections/userHabits 是当前用户记忆，只作为个人偏好参考；relevantRules 是通过 retrieveRelevantRules 召回的本轮相关规则，可以用于当前判断；pendingRuleCandidates 只能提示人工审核，不能当事实执行。不要要求前端把全量 approvedSystemRules 塞进上下文。筛选类自然语言优先调用 retrieveRelevantRules 和 resolveReportFilterIntent：先召回 query/moduleId 相关规则，再解析整体意图；返回 execute 直接执行，execute_with_note 先执行并说明假设，clarify 才追问。不要因为出现疑似二级词就默认追问；对筛选、排序、关键词检索这类可撤销动作，中置信度应先执行再允许用户纠正。注意：如果用户说“半导体相关的基金”“新能源相关基金”“AI 主题基金”，基金优先表示一级分类=基金研究，行业/主题词作为 keyword，不要按股票研究二级筛选追问；如果用户说评分不低于、评分至少、80分以上，使用 scoreMin 参数。若用户同一句话已经明确指定一级分类并要求先加载该一级的二级筛选，再指定二级值，例如“先加载股票研究的二级筛选，再只看电力设备”，则视为用户已确认二级筛选意图，不要再次追问；应先调用 loadSecondaryFilterOptions，等待接口返回候选项，确认包含该二级值后再 setReportFilter，并传 secondaryConfirmedByUser=true，最后 loadReports。用户明确纠错或表达偏好时，调用 recordLearningCase、recordUserMemory 或 proposeSystemRule 沉淀经验；如果纠正的是当前筛选且已经足够执行，必须按纠正后的逻辑重新调用工具处理当前任务。",
     value: contextValue,
   });
 
@@ -490,6 +503,28 @@ export default function App() {
     ),
   });
 
+  // AI 可调用学习动作：按当前用户输入和模块检索少量相关规则，避免把全量规则塞进上下文。
+  useFrontendTool({
+    name: "retrieveRelevantRules",
+    description:
+      "根据用户原话、当前模块和 topK 从已批准规则库中召回少量相关规则。处理复杂筛选或规则可能很多时，应先调用本工具，再调用具体模块的意图解析和业务工具。",
+    parameters: z.object({
+      query: z.string().describe("用户当前原话或需要匹配规则的任务描述。"),
+      moduleId: z.enum(["global", "report", "fund", "manager", "portfolio"]).optional().describe("当前模块。研报工作台默认 report。"),
+      topK: z.number().int().min(1).max(8).optional().describe("最多返回多少条规则，默认 5。"),
+    }),
+    handler: async ({ query, moduleId = "report", topK = 5 }) => {
+      const result = refreshRelevantRules({ query, moduleId, topK });
+      pushActivity(`召回相关规则：${result.returnedRules}/${result.totalApprovedRules} 条`, {
+        actor: "ai",
+        type: "retrieveRelevantRules",
+        status: "completed",
+        payload: result,
+      });
+      return result;
+    },
+  });
+
   // AI 可调用学习动作：保存当前用户的偏好、习惯或纠错。它只影响当前用户，不直接升级为全局规则。
   useFrontendTool({
     name: "recordUserMemory",
@@ -503,12 +538,30 @@ export default function App() {
       confidence: z.enum(["low", "medium", "high"]).optional().describe("置信度。"),
     }),
     handler: async (params) => {
+      const reusableCandidate = looksReusableRuleText(`${params.value} ${params.evidence || ""}`)
+        ? extractRuleCandidateFromFeedback({
+            userText: params.evidence || "",
+            aiBehavior: "AI 将用户纠正先记录为用户记忆。",
+            userFeedback: params.value,
+            finalFix: params.value,
+          })
+        : null;
       updateKnowledgeBase(
-        (current) => addUserMemory(current, params),
+        (current) => {
+          const withMemory = addUserMemory(current, params);
+          return reusableCandidate ? addRuleCandidate(withMemory, reusableCandidate) : withMemory;
+        },
         `记录用户记忆：${params.key}`,
-        { type: params.type, key: params.key, value: params.value },
+        { type: params.type, key: params.key, value: params.value, generatedRuleCandidate: Boolean(reusableCandidate) },
       );
-      return `已记录当前用户记忆：${params.key}。`;
+      return {
+        saved: true,
+        memoryKey: params.key,
+        generatedRuleCandidate: reusableCandidate,
+        nextStep: reusableCandidate
+          ? "这条用户记忆包含可复用判断，已同步生成待审核规则。若用户纠正的是当前筛选结果，还应重新调用筛选工具处理当前请求。"
+          : "已记录当前用户记忆。若这是可复用业务规则，请继续调用 proposeSystemRule。",
+      };
     },
   });
 
@@ -546,6 +599,11 @@ export default function App() {
     parameters: z.object({
       ruleType: z.enum(["parsing_rule", "domain_rule", "workflow_rule", "interaction_rule", "safety_rule"]).describe("规则类型。"),
       abstractRule: z.string().describe("抽象后的规则，必须说明适用边界。"),
+      summary: z.string().optional().describe("压缩摘要，后续检索命中后优先给模型看。"),
+      scope: z.enum(["global", "module", "user"]).optional().describe("规则作用域。"),
+      moduleId: z.enum(["global", "report", "fund", "manager", "portfolio"]).optional().describe("规则适用模块。"),
+      priority: z.number().int().min(1).max(100).optional().describe("规则优先级，越高越容易被召回。"),
+      triggers: z.array(z.string()).optional().describe("触发词，用于轻量检索。"),
       examples: z.array(z.string()).optional().describe("正例。"),
       counterExamples: z.array(z.string()).optional().describe("反例或不适用场景。"),
       evidence: z.string().optional().describe("来源证据。"),
@@ -618,14 +676,19 @@ export default function App() {
       userText: z.string().describe("用户完整原话。"),
     }),
     handler: async ({ userText }) => {
+      const relevantRules = refreshRelevantRules({ query: userText, moduleId: "report", topK: 5 });
       const result = resolveReportFilterIntent(userText);
       pushActivity(`解析筛选意图：${userText}`, {
         actor: "ai",
         type: "resolveReportFilterIntent",
         status: "completed",
-        payload: result,
+        payload: { result, relevantRules },
       });
-      return result;
+      return {
+        ...result,
+        relevantRules,
+        rulePolicy: "本工具已自动召回相关规则；如果 relevantRules 中有适用规则，应优先于模型常识。",
+      };
     },
   });
 
@@ -698,7 +761,7 @@ export default function App() {
   useFrontendTool({
     name: "setReportFilter",
     description:
-      "设置研报筛选、排序和分页条件。若设置具体 secondaryCategory，必须确保它来自当前 primaryCategory 的二级候选项，并且用户已经明确确认 secondaryConfirmedByUser=true。",
+      "设置研报筛选、排序和分页条件。切换 primaryCategory 时工具会自动加载该一级下的二级候选项。若设置具体 secondaryCategory，必须确保它来自当前 primaryCategory 的二级候选项，并且用户已经明确确认 secondaryConfirmedByUser=true。",
     parameters: z.object({
       keyword: z.string().optional().describe("关键词，例如 储能、AI、ETF、利率。空字符串表示不按关键词筛选。"),
       broker: brokerEnum.optional().describe("券商筛选。"),
@@ -724,17 +787,27 @@ export default function App() {
       const { secondaryConfirmedByUser, ...filterParams } = params;
       const pageSize = params.pageSize ? Number(params.pageSize) : undefined;
       const primaryCategory = params.primaryCategory || filterRef.current.primaryCategory;
-      const availableSecondary = secondaryOptionsRef.current;
+      const primaryChanged = Boolean(params.primaryCategory && params.primaryCategory !== filterRef.current.primaryCategory);
+      let availableSecondary = secondaryOptionsRef.current;
       let secondaryCategory = params.secondaryCategory;
 
       if (params.secondaryCategory && params.secondaryCategory !== "全部" && !secondaryConfirmedByUser) {
         return `二级筛选「${params.secondaryCategory}」不能直接确认。请先向用户追问是否按该二级方向筛选；用户确认后，再请求二级候选项并传 secondaryConfirmedByUser=true。`;
       }
 
+      if (primaryChanged) {
+        const secondaryResult = await fetchSecondaryOptions(primaryCategory, "AI 切换一级筛选时自动加载二级候选项", {
+          actor: "ai",
+        });
+        if (!secondaryResult.ok) {
+          return `一级筛选已尝试切换到「${primaryCategory}」，但二级候选项加载失败：${secondaryResult.error}。已停止设置筛选，避免二级筛选状态不完整。`;
+        }
+        availableSecondary = secondaryResult.secondaryOptions;
+      }
+
       // 一级分类变化后，旧二级分类通常已经不属于新的一级分类；但如果本次同时传入了已确认且合法的新二级值，应保留它。
       if (
-        params.primaryCategory &&
-        params.primaryCategory !== filterRef.current.primaryCategory &&
+        primaryChanged &&
         (!params.secondaryCategory || params.secondaryCategory === "全部")
       ) {
         secondaryCategory = "全部";
@@ -1332,7 +1405,7 @@ export default function App() {
           <div className="section-title-row">
             <div>
               <h2>知识沉淀</h2>
-              <p>用户记忆影响当前用户；已批准系统规则才会作为通用规则进入 Copilot 上下文。</p>
+              <p>用户记忆影响当前用户；规则库全量保存，但每轮只召回少量相关规则进入 Copilot 上下文。</p>
             </div>
             <button type="button" className="ghost-button" onClick={resetLearningPanel}>
               重置
@@ -1356,8 +1429,36 @@ export default function App() {
               <strong>已生效系统规则</strong>
               <span>{knowledgeBase.systemRules.approved.length} 条</span>
               {knowledgeBase.systemRules.approved.slice(0, 4).map((item) => (
-                <p key={item.id}>{item.abstractRule}</p>
+                <p key={item.id}>
+                  {item.summary || item.abstractRule}
+                  <small>
+                    {item.moduleId || "global"} · P{item.priority || 50}
+                  </small>
+                </p>
               ))}
+            </article>
+
+            <article>
+              <strong>本轮规则召回</strong>
+              <span>{activeRuleContext ? `${activeRuleContext.returnedRules}/${activeRuleContext.totalApprovedRules} 条` : "未召回"}</span>
+              {activeRuleContext ? (
+                <>
+                  <p>
+                    查询：{activeRuleContext.query || "空"}
+                    <small>模块：{activeRuleContext.moduleId}</small>
+                  </p>
+                  {activeRuleContext.rules.map((item) => (
+                    <p key={item.id}>
+                      {item.summary}
+                      <small>
+                        {item.scope}/{item.moduleId} · score {item.score}
+                      </small>
+                    </p>
+                  ))}
+                </>
+              ) : (
+                <p>AI 处理筛选前会调用 retrieveRelevantRules，按 query 和模块召回 Top K 规则。</p>
+              )}
             </article>
 
             <article>

@@ -431,6 +431,11 @@ table {
   font-size: 13px;
 }
 
+[class*="copilot" i] table,
+[class*="Copilot" i] table {
+  display: none !important;
+}
+
 thead {
   position: sticky;
   top: 0;
@@ -776,6 +781,14 @@ td:nth-child(3) {
   background: #ffffff;
   font-size: 12px;
   line-height: 1.65;
+}
+
+.learning-grid p small {
+  display: block;
+  margin-top: 5px;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 800;
 }
 
 .candidate-rule {
