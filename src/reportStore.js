@@ -28,6 +28,11 @@ export const SECONDARY_TERM_HINTS = [
   { terms: ["新能源", "光伏", "储能", "风电"], primaryCandidates: ["股票研究"], askLabel: "股票研究下的新能源方向" },
   { terms: ["半导体", "芯片", "先进封装"], primaryCandidates: ["股票研究"], askLabel: "股票研究下的半导体方向" },
   { terms: ["人工智能", "AI", "算力", "大模型"], primaryCandidates: ["股票研究"], askLabel: "股票研究下的人工智能方向" },
+  { terms: ["电力设备", "电网", "特高压", "配网"], primaryCandidates: ["股票研究"], askLabel: "股票研究下的电力设备方向" },
+  { terms: ["机器人", "人形机器人", "减速器", "执行器"], primaryCandidates: ["股票研究"], askLabel: "股票研究下的机器人方向" },
+  { terms: ["消费电子", "智能手机", "AI终端", "AI 终端"], primaryCandidates: ["股票研究"], askLabel: "股票研究下的消费电子方向" },
+  { terms: ["医药生物", "创新药", "医疗服务"], primaryCandidates: ["股票研究"], askLabel: "股票研究下的医药生物方向" },
+  { terms: ["银行", "息差", "高股息"], primaryCandidates: ["股票研究"], askLabel: "股票研究下的银行方向" },
   { terms: ["主动权益", "权益基金", "基金经理"], primaryCandidates: ["基金研究"], askLabel: "基金研究下的主动权益方向" },
   { terms: ["指数基金", "ETF", "宽基"], primaryCandidates: ["基金研究"], askLabel: "基金研究下的指数基金方向" },
   { terms: ["固收+", "固收加", "债券基金"], primaryCandidates: ["基金研究", "债券研究"], askLabel: "基金研究或债券研究中的固收方向" },
@@ -35,7 +40,7 @@ export const SECONDARY_TERM_HINTS = [
   { terms: ["市场策略", "主题交易", "资金面"], primaryCandidates: ["宏观策略"], askLabel: "宏观策略下的市场策略方向" },
 ];
 
-export function resolveSecondaryTermHint(term = "") {
+export function resolveSecondaryTermHint(term = "", explicitPrimaryCategory = "") {
   const normalizedTerm = term.trim().toLowerCase();
   if (!normalizedTerm) {
     return {
@@ -62,6 +67,19 @@ export function resolveSecondaryTermHint(term = "") {
 
   const primaryCandidates = [...new Set(matchedHints.flatMap((hint) => hint.primaryCandidates))];
   const labels = matchedHints.map((hint) => hint.askLabel);
+  const explicitPrimaryMatched = explicitPrimaryCategory && primaryCandidates.includes(explicitPrimaryCategory);
+
+  if (explicitPrimaryMatched) {
+    return {
+      matched: true,
+      term,
+      explicitPrimaryCategory,
+      primaryCandidates,
+      labels,
+      needsClarification: false,
+      message: `用户已经明确一级分类为“${explicitPrimaryCategory}”，且“${term}”可归入该一级下的二级方向。请先请求该一级的二级候选项，接口返回后再选择匹配的二级选项并设置筛选。`,
+    };
+  }
 
   return {
     matched: true,
@@ -70,6 +88,149 @@ export function resolveSecondaryTermHint(term = "") {
     labels,
     needsClarification: true,
     message: `“${term}”可能对应${labels.join("、")}。二级筛选不能直接确认，请先向用户确认是否按这个方向筛选。`,
+  };
+}
+
+function firstIncluded(text, options) {
+  return options.find((item) => item !== "全部" && text.includes(item));
+}
+
+function findSecondaryByText(text) {
+  for (const [primaryCategory, secondaryList] of Object.entries(PRIMARY_FILTERS)) {
+    const secondaryCategory = secondaryList.find((item) => item !== "全部" && text.includes(item));
+    if (secondaryCategory) {
+      return { primaryCategory, secondaryCategory };
+    }
+  }
+  return null;
+}
+
+function extractScoreMin(text) {
+  const matched = text.match(/(?:评分|分数)?(?:不低于|至少|大于等于|>=|以上)\s*(\d{2,3})|(\d{2,3})\s*分?以上/);
+  if (!matched) return undefined;
+  const value = Number(matched[1] || matched[2]);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function extractOrder(text) {
+  if (!/(按|排序|升序|降序|倒序)/.test(text)) return {};
+  if (text.includes("热度")) return { orderBy: "readCount", direction: text.includes("升序") ? "asc" : "desc" };
+  if (text.includes("评分") || text.includes("分数")) return { orderBy: "score", direction: text.includes("升序") ? "asc" : "desc" };
+  if (text.includes("评级")) return { orderBy: "rating", direction: text.includes("升序") ? "asc" : "desc" };
+  if (text.includes("日期") || text.includes("时间")) return { orderBy: "date", direction: text.includes("升序") ? "asc" : "desc" };
+  return {};
+}
+
+function extractRisk(text) {
+  if (/低风险|风险低/.test(text)) return "低";
+  if (/中风险|风险中/.test(text)) return "中";
+  if (/高风险|风险高/.test(text)) return "高";
+  return "";
+}
+
+function extractThemeKeyword(text) {
+  const matchedHint = SECONDARY_TERM_HINTS.find((hint) => hint.terms.some((term) => text.includes(term)));
+  if (!matchedHint) return "";
+  const exactTerm = matchedHint.terms.find((term) => text.includes(term));
+  return exactTerm || "";
+}
+
+export function resolveReportFilterIntent(userText = "") {
+  const text = userText.replace(/\s+/g, "");
+  const filterPatch = {};
+  const notes = [];
+  let confidence = "medium";
+  let action = "execute_with_note";
+  let question = "";
+
+  const broker = firstIncluded(text, BROKERS);
+  const rating = firstIncluded(text, RATINGS);
+  const risk = extractRisk(text);
+  const analyst = firstIncluded(text, ANALYSTS);
+  const explicitPrimary = firstIncluded(text, PRIMARY_OPTIONS);
+  const explicitSecondary = findSecondaryByText(text);
+  const scoreMin = extractScoreMin(text);
+  const order = extractOrder(text);
+  const themeKeyword = extractThemeKeyword(text);
+
+  if (broker) filterPatch.broker = broker;
+  if (rating) filterPatch.rating = rating;
+  if (risk) filterPatch.risk = risk;
+  if (analyst) filterPatch.analyst = analyst;
+  if (scoreMin !== undefined) filterPatch.scoreMin = scoreMin;
+  Object.assign(filterPatch, order);
+
+  const saysFund = /基金|FOF|ETF|QDII|固收\+|固收加/.test(text);
+  const saysStock = /股票|行业|板块|个股/.test(text);
+  const saysBond = /债券|转债|可转债|利率债|信用债|城投债|地产债/.test(text);
+
+  if (saysFund && themeKeyword && !explicitPrimary) {
+    filterPatch.primaryCategory = "基金研究";
+    filterPatch.keyword = themeKeyword;
+    confidence = "high";
+    action = "execute";
+    notes.push(`“基金”已明确对象为基金研究，“${themeKeyword}”按主题关键词检索。`);
+  } else if (explicitPrimary && explicitPrimary !== "全部") {
+    filterPatch.primaryCategory = explicitPrimary;
+    confidence = "high";
+    action = "execute";
+    if (explicitSecondary && explicitSecondary.primaryCategory === explicitPrimary) {
+      filterPatch.secondaryCategory = explicitSecondary.secondaryCategory;
+      filterPatch.secondaryConfirmedByUser = true;
+      notes.push(`用户已明确一级分类“${explicitPrimary}”和二级方向“${explicitSecondary.secondaryCategory}”。`);
+    } else if (themeKeyword) {
+      filterPatch.keyword = themeKeyword;
+      notes.push(`用户已明确一级分类“${explicitPrimary}”，“${themeKeyword}”按关键词检索。`);
+    }
+  } else if (explicitSecondary) {
+    filterPatch.primaryCategory = explicitSecondary.primaryCategory;
+    filterPatch.secondaryCategory = explicitSecondary.secondaryCategory;
+    filterPatch.secondaryConfirmedByUser = true;
+    confidence = saysStock || saysBond ? "high" : "medium";
+    action = confidence === "high" ? "execute" : "execute_with_note";
+    notes.push(`先按最可能的分类理解为“${explicitSecondary.primaryCategory} / ${explicitSecondary.secondaryCategory}”。`);
+  } else if (saysFund) {
+    filterPatch.primaryCategory = "基金研究";
+    confidence = "high";
+    action = "execute";
+  } else if (saysStock) {
+    filterPatch.primaryCategory = "股票研究";
+    confidence = "medium";
+    action = "execute_with_note";
+    notes.push("按“股票研究”理解；如需基金或债券方向，可继续要求调整。");
+  } else if (saysBond) {
+    filterPatch.primaryCategory = "债券研究";
+    confidence = "medium";
+    action = "execute_with_note";
+  }
+
+  if (Object.keys(filterPatch).length === 0) {
+    confidence = "low";
+    action = "clarify";
+    question = "请补充想筛选的对象，例如基金、股票研究、债券研究、券商、评分或关键词。";
+  }
+
+  const nextSteps = [];
+  if (action === "clarify") {
+    nextSteps.push("向用户追问 question，不要执行筛选。");
+  } else if (filterPatch.secondaryCategory && filterPatch.secondaryCategory !== "全部") {
+    nextSteps.push("先调用 loadSecondaryFilterOptions，传入 filterPatch.primaryCategory，等待二级候选项返回。");
+    nextSteps.push("如果候选项包含 filterPatch.secondaryCategory，再调用 setReportFilter，并保留 secondaryConfirmedByUser=true。");
+    nextSteps.push("调用 loadReports 刷新列表。");
+  } else {
+    nextSteps.push("调用 setReportFilter 设置 filterPatch。");
+    nextSteps.push("调用 loadReports 刷新列表。");
+  }
+
+  return {
+    confidence,
+    action,
+    filterPatch,
+    needsClarification: action === "clarify",
+    question,
+    notes,
+    nextSteps,
+    policy: "高置信度直接执行；中置信度先执行并说明假设；低置信度才追问。敏感动作仍需确认。",
   };
 }
 
@@ -106,6 +267,13 @@ const titleTemplates = {
   地产债: ["地产链信用修复跟踪", "房企债务展期观察", "销售改善对债券定价影响"],
 };
 
+const fundThemeTerms = ["半导体", "新能源", "人工智能", "医药生物", "消费电子", "机器人", "银行", "高股息"];
+
+function getFundThemeKeyword(primaryCategory, secondaryIndex, brokerIndex, ratingIndex) {
+  if (primaryCategory !== "基金研究") return "";
+  return fundThemeTerms[(secondaryIndex + brokerIndex + ratingIndex) % fundThemeTerms.length];
+}
+
 // 从二级分类反推一级分类，生成模拟数据和校验筛选合法性时都会用到。
 const primaryBySecondary = Object.entries(PRIMARY_FILTERS).reduce((map, [primary, secondaryList]) => {
   secondaryList.forEach((secondary) => {
@@ -138,6 +306,8 @@ function buildReports() {
         const score = 60 + ((secondaryIndex * 11 + brokerIndex * 5 + ratingIndex * 7) % 39);
         const readCount = 1200 + ((secondaryIndex * 977 + brokerIndex * 431 + ratingIndex * 263) % 8600);
         const analyst = analystCycle[(secondaryIndex + brokerIndex + ratingIndex) % analystCycle.length];
+        const fundThemeKeyword = getFundThemeKeyword(primaryCategory, secondaryIndex, brokerIndex, ratingIndex);
+        const themeSuffix = fundThemeKeyword ? `，重点覆盖${fundThemeKeyword}主题基金` : "";
 
         rows.push({
           id: `r-${String(index + 1).padStart(3, "0")}`,
@@ -151,7 +321,7 @@ function buildReports() {
           score,
           readCount,
           risk: riskCycle[(secondaryIndex + ratingIndex) % riskCycle.length],
-          summary: `${broker}${analyst}认为，${secondaryCategory}当前处于${score >= 82 ? "高景气" : score >= 72 ? "修复" : "观察"}阶段，建议结合估值分位、资金流和基本面验证信号，关注后续政策、订单和盈利预期变化。`,
+          summary: `${broker}${analyst}认为，${secondaryCategory}当前处于${score >= 82 ? "高景气" : score >= 72 ? "修复" : "观察"}阶段${themeSuffix}，建议结合估值分位、资金流和基本面验证信号，关注后续政策、订单和盈利预期变化。`,
         });
       });
     });

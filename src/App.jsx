@@ -22,8 +22,22 @@ import {
   normalizeFilter,
   queryReports,
   requestSecondaryOptions,
+  resolveReportFilterIntent,
   resolveSecondaryTermHint,
 } from "./reportStore.js";
+import {
+  addRuleCandidate,
+  addUserMemory,
+  approveRuleCandidate,
+  dismissRuleCandidate,
+  extractRuleCandidateFromFeedback,
+  forgetUserMemory,
+  loadKnowledgeBase,
+  recordLearningCase,
+  resetKnowledgeBase,
+  saveKnowledgeBase,
+  summarizeKnowledgeForAgent,
+} from "./memoryStore.js";
 
 // 页面筛选条件的唯一默认值。所有“清空条件”和首次加载都从这里恢复，避免手动维护多份默认状态。
 const defaultFilter = normalizeFilter({
@@ -111,7 +125,10 @@ export default function App() {
   ]);
   const operationLogRef = useRef(initialOperationLogRef.current);
   const [operationLog, setOperationLog] = useState(initialOperationLogRef.current);
+  const [knowledgeBase, setKnowledgeBase] = useState(() => loadKnowledgeBase());
+  const knowledgeBaseRef = useRef(knowledgeBase);
   const [copilotStarted, setCopilotStarted] = useState(false);
+  const [activeTab, setActiveTab] = useState("workbench");
   const { agent } = useAgent({
     agentId: "report_agent",
     updates: [UseAgentUpdate.OnRunStatusChanged],
@@ -158,6 +175,20 @@ export default function App() {
   // 页面操作流水同时服务 UI 审计和 Copilot 上下文，避免 AI 只靠对话历史猜测用户做过什么。
   function pushActivity(message, metadata = {}) {
     recordOperation({ summary: message, ...metadata });
+  }
+
+  function updateKnowledgeBase(updater, summary, payload = {}) {
+    const nextKnowledgeBase = updater(knowledgeBaseRef.current);
+    knowledgeBaseRef.current = nextKnowledgeBase;
+    setKnowledgeBase(nextKnowledgeBase);
+    saveKnowledgeBase(nextKnowledgeBase);
+    pushActivity(summary, {
+      actor: "system",
+      type: "learningMemory",
+      status: "completed",
+      payload,
+    });
+    return nextKnowledgeBase;
   }
 
   function startTrackedOperation(label) {
@@ -399,11 +430,17 @@ export default function App() {
         canInterrupt,
         policy: "用户打断只停止 AI 继续输出和继续规划后续工具调用；已经发出的前端业务请求会继续完成，并照常更新共享页面状态。",
       },
+      learningMemory: summarizeKnowledgeForAgent(knowledgeBase),
       requiredWorkflowForSecondaryFilter: [
-        "先调用 resolveSecondaryFilterIntent 判断疑似二级词属于哪个一级方向，并追问用户确认",
-        "用户确认后再调用 loadSecondaryFilterOptions，传入一级筛选 primaryCategory",
+        "筛选类自然语言优先调用 resolveReportFilterIntent 解析整体意图；返回 execute 直接执行，execute_with_note 先执行并说明假设，clarify 才追问",
+        "不要因为出现疑似二级词就默认追问；对可撤销的筛选动作，中置信度应先执行再允许用户纠正",
+        "如果用户说“半导体相关的基金”“新能源相关基金”“AI 主题基金”，基金优先表示一级分类=基金研究，行业/主题词作为 keyword，不要按股票研究二级筛选追问",
+        "如果用户说评分不低于、评分至少、80分以上，使用 scoreMin 参数，不要误用评级 rating",
+        "如果用户只说疑似二级词，先调用 resolveSecondaryFilterIntent 判断可能一级方向，并追问用户确认",
+        "如果用户同一句话已经明确指定一级分类，并要求先加载该一级的二级筛选，再指定二级值，则视为用户已确认二级筛选意图，不要再次追问",
+        "已确认二级意图后，调用 loadSecondaryFilterOptions，传入一级筛选 primaryCategory",
         "等待 loadSecondaryFilterOptions 返回；如果 ok=false，不要继续设置二级筛选，应告知用户接口失败",
-        "拿到接口返回候选项后，调用 setReportFilter 设置 secondaryCategory，并传入 secondaryConfirmedByUser=true",
+        "拿到接口返回候选项后，如果候选项包含用户指定的二级值，调用 setReportFilter 设置 secondaryCategory，并传入 secondaryConfirmedByUser=true",
         "最后调用 loadReports 刷新列表",
       ],
       availableWorkflows: [
@@ -423,6 +460,7 @@ export default function App() {
       canInterrupt,
       filter,
       loading,
+      knowledgeBase,
       operationLog,
       pagination,
       reports,
@@ -434,7 +472,7 @@ export default function App() {
 
   useAgentContext({
     description:
-      "研报工作台当前状态。recentOperations 是用户、AI 和系统请求的结构化操作日志，回答“刚才做了什么”时必须优先依据它。注意：如果用户提到疑似二级筛选，例如新能源、半导体、主动权益、利率债、可转债，不能直接确认二级值；必须先调用 resolveSecondaryFilterIntent 生成金融语义判断和追问，等用户确认后，再调用 loadSecondaryFilterOptions 模拟接口请求二级候选项，最后才能 setReportFilter 和 loadReports。",
+      "研报工作台当前状态。recentOperations 是用户、AI 和系统请求的结构化操作日志，回答“刚才做了什么”时必须优先依据它。learningMemory 中 userPreferences/userCorrections/userHabits 是当前用户记忆，只作为个人偏好参考；approvedSystemRules 是可执行的通用规则；pendingRuleCandidates 只能提示人工审核，不能当事实执行。筛选类自然语言优先调用 resolveReportFilterIntent 解析整体意图；返回 execute 直接执行，execute_with_note 先执行并说明假设，clarify 才追问。不要因为出现疑似二级词就默认追问；对筛选、排序、关键词检索这类可撤销动作，中置信度应先执行再允许用户纠正。注意：如果用户说“半导体相关的基金”“新能源相关基金”“AI 主题基金”，基金优先表示一级分类=基金研究，行业/主题词作为 keyword，不要按股票研究二级筛选追问；如果用户说评分不低于、评分至少、80分以上，使用 scoreMin 参数。若用户同一句话已经明确指定一级分类并要求先加载该一级的二级筛选，再指定二级值，例如“先加载股票研究的二级筛选，再只看电力设备”，则视为用户已确认二级筛选意图，不要再次追问；应先调用 loadSecondaryFilterOptions，等待接口返回候选项，确认包含该二级值后再 setReportFilter，并传 secondaryConfirmedByUser=true，最后 loadReports。用户明确纠错或表达偏好时，调用 recordLearningCase、recordUserMemory 或 proposeSystemRule 沉淀经验。",
     value: contextValue,
   });
 
@@ -452,17 +490,157 @@ export default function App() {
     ),
   });
 
-  // AI 可调用动作 0：用金融相似词典做意图提示，但不直接确认二级筛选。
+  // AI 可调用学习动作：保存当前用户的偏好、习惯或纠错。它只影响当前用户，不直接升级为全局规则。
+  useFrontendTool({
+    name: "recordUserMemory",
+    description:
+      "当用户明确表达个人偏好、习惯或对 AI 行为的纠正时调用。该记忆只影响当前用户，不代表所有用户的通用规则。",
+    parameters: z.object({
+      type: z.enum(["preference", "correction", "habit"]).describe("记忆类型。preference=偏好，correction=纠错，habit=行为习惯。"),
+      key: z.string().describe("稳定的记忆键，例如 clarification_style、export_format、fund_theme_preference。"),
+      value: z.string().describe("要保存的记忆内容，尽量具体但不要泄露敏感信息。"),
+      evidence: z.string().optional().describe("来自用户原话或本次对话的证据。"),
+      confidence: z.enum(["low", "medium", "high"]).optional().describe("置信度。"),
+    }),
+    handler: async (params) => {
+      updateKnowledgeBase(
+        (current) => addUserMemory(current, params),
+        `记录用户记忆：${params.key}`,
+        { type: params.type, key: params.key, value: params.value },
+      );
+      return `已记录当前用户记忆：${params.key}。`;
+    },
+  });
+
+  // AI 可调用学习动作：把一次具体纠错变成案例，同时用启发式规则生成一个“待审核规则候选”。
+  useFrontendTool({
+    name: "recordLearningCase",
+    description:
+      "当用户指出 AI 判断不合理、追问过多、字段解析错误或工作流错误时调用。工具会记录案例，并提炼一个待人工审核的通用规则候选。",
+    parameters: z.object({
+      userText: z.string().describe("触发问题的用户原话。"),
+      aiBehavior: z.string().describe("AI 当时做了什么，例如错误追问、误用字段、未调用接口。"),
+      userFeedback: z.string().describe("用户反馈或纠错内容。"),
+      finalFix: z.string().optional().describe("最终修正方式。"),
+    }),
+    handler: async (params) => {
+      const candidate = extractRuleCandidateFromFeedback(params);
+      updateKnowledgeBase(
+        (current) => addRuleCandidate(recordLearningCase(current, params), candidate),
+        `记录学习案例并生成规则候选：${candidate.ruleType}`,
+        { case: params, candidate },
+      );
+      return {
+        saved: true,
+        candidate,
+        nextStep: "候选规则不会自动生效，需要人工调用 approveSystemRule 或在界面上确认后才进入 approvedSystemRules。",
+      };
+    },
+  });
+
+  // AI 可调用学习动作：当模型能抽象出可复用规则时，先提交为候选，不自动生效。
+  useFrontendTool({
+    name: "proposeSystemRule",
+    description:
+      "把多次用户反馈中可复用的经验提炼成通用规则候选。候选规则默认 pending，不能直接覆盖当前工具事实或业务接口结果。",
+    parameters: z.object({
+      ruleType: z.enum(["parsing_rule", "domain_rule", "workflow_rule", "interaction_rule", "safety_rule"]).describe("规则类型。"),
+      abstractRule: z.string().describe("抽象后的规则，必须说明适用边界。"),
+      examples: z.array(z.string()).optional().describe("正例。"),
+      counterExamples: z.array(z.string()).optional().describe("反例或不适用场景。"),
+      evidence: z.string().optional().describe("来源证据。"),
+      confidence: z.enum(["low", "medium", "high"]).optional().describe("置信度。"),
+    }),
+    handler: async (params) => {
+      updateKnowledgeBase(
+        (current) => addRuleCandidate(current, params),
+        `生成待审核系统规则：${params.ruleType}`,
+        { rule: params },
+      );
+      return "已生成待审核系统规则。该规则尚未生效，需要人工审核。";
+    },
+  });
+
+  useFrontendTool({
+    name: "approveSystemRule",
+    description: "人工确认某条待审核规则后调用，使它进入 approvedSystemRules 并在后续对话中生效。",
+    parameters: z.object({
+      candidateId: z.string().describe("待审核规则 id。"),
+    }),
+    handler: async ({ candidateId }) => {
+      updateKnowledgeBase(
+        (current) => approveRuleCandidate(current, candidateId),
+        `批准系统规则：${candidateId}`,
+        { candidateId },
+      );
+      return `已批准规则 ${candidateId}。`;
+    },
+  });
+
+  useFrontendTool({
+    name: "dismissSystemRule",
+    description: "人工驳回某条待审核规则候选时调用。",
+    parameters: z.object({
+      candidateId: z.string().describe("待审核规则 id。"),
+    }),
+    handler: async ({ candidateId }) => {
+      updateKnowledgeBase(
+        (current) => dismissRuleCandidate(current, candidateId),
+        `驳回系统规则候选：${candidateId}`,
+        { candidateId },
+      );
+      return `已驳回规则候选 ${candidateId}。`;
+    },
+  });
+
+  useFrontendTool({
+    name: "forgetUserMemory",
+    description: "删除某条当前用户记忆。",
+    parameters: z.object({
+      memoryId: z.string().describe("用户记忆 id。"),
+    }),
+    handler: async ({ memoryId }) => {
+      updateKnowledgeBase(
+        (current) => forgetUserMemory(current, memoryId),
+        `删除用户记忆：${memoryId}`,
+        { memoryId },
+      );
+      return `已删除用户记忆 ${memoryId}。`;
+    },
+  });
+
+  // AI 可调用动作 0：先做整体意图解析，用置信度决定直接执行、边执行边说明，还是追问。
+  useFrontendTool({
+    name: "resolveReportFilterIntent",
+    description:
+      "解析用户筛选类自然语言，返回 filterPatch、confidence 和 action。高置信 execute 直接 setReportFilter+loadReports；中置信 execute_with_note 先执行并说明假设；低置信 clarify 才追问。",
+    parameters: z.object({
+      userText: z.string().describe("用户完整原话。"),
+    }),
+    handler: async ({ userText }) => {
+      const result = resolveReportFilterIntent(userText);
+      pushActivity(`解析筛选意图：${userText}`, {
+        actor: "ai",
+        type: "resolveReportFilterIntent",
+        status: "completed",
+        payload: result,
+      });
+      return result;
+    },
+  });
+
+  // AI 可调用动作 1：用金融相似词典做二级词提示，但不直接确认二级筛选。
   useFrontendTool({
     name: "resolveSecondaryFilterIntent",
     description:
-      "当用户直接说可转债、新能源、半导体、主动权益、固收+等疑似二级筛选词时，先调用本工具。它只返回可能的一级方向和追问建议，不能直接确认二级筛选值。",
+      "当用户直接说可转债、新能源、电力设备、半导体、主动权益、固收+等疑似二级筛选词时，先调用本工具。它只返回可能的一级方向和追问建议，不能直接确认二级筛选值；但如果用户原话已经明确一级分类，可传 explicitPrimaryCategory，此时工具会判断是否已经不需要追问。",
     parameters: z.object({
       term: z.string().describe("用户提到的疑似二级筛选词或金融术语。"),
       userText: z.string().optional().describe("用户完整原话，便于审计。"),
+      explicitPrimaryCategory: primaryEnum.optional().describe("用户原话中已经明确指定的一级分类，例如 股票研究。"),
     }),
-    handler: async ({ term }) => {
-      const result = resolveSecondaryTermHint(term);
+    handler: async ({ term, explicitPrimaryCategory }) => {
+      const result = resolveSecondaryTermHint(term, explicitPrimaryCategory);
       pushActivity(`识别疑似二级筛选：${term}`, {
         actor: "ai",
         type: "resolveSecondaryFilterIntent",
@@ -471,7 +649,9 @@ export default function App() {
       });
       return {
         ...result,
-        rule: "二级筛选必须先追问用户确认；确认后再调用 loadSecondaryFilterOptions 请求候选项，然后 setReportFilter 时传 secondaryConfirmedByUser=true。",
+        rule: result.needsClarification
+          ? "二级筛选必须先追问用户确认；确认后再调用 loadSecondaryFilterOptions 请求候选项，然后 setReportFilter 时传 secondaryConfirmedByUser=true。"
+          : "用户已在原话中明确一级分类和二级筛选意图，不需要再次追问；请调用 loadSecondaryFilterOptions，请求成功且候选项包含该二级值后，setReportFilter 时传 secondaryConfirmedByUser=true。",
       };
     },
   });
@@ -480,7 +660,7 @@ export default function App() {
   useFrontendTool({
     name: "loadSecondaryFilterOptions",
     description:
-      "根据一级筛选模拟接口请求二级筛选候选项。用户提到疑似二级条件时，必须先调用 resolveSecondaryFilterIntent 并追问确认，再调用本工具。",
+      "根据一级筛选模拟接口请求二级筛选候选项。用户只提到疑似二级条件时，必须先调用 resolveSecondaryFilterIntent 并追问确认，再调用本工具；如果用户原话已经明确一级分类并要求加载二级筛选，可直接调用本工具。",
     parameters: z.object({
       primaryCategory: primaryEnum.describe("一级筛选：全部、股票研究、基金研究、宏观策略、债券研究。"),
       reason: z.string().optional().describe("加载二级筛选的原因。"),
@@ -509,7 +689,7 @@ export default function App() {
         primaryCategory: result.primaryCategory,
         secondaryOptions: result.secondaryOptions,
         attempts: result.attempts,
-        nextStep: "只有用户已经明确确认要按某个二级方向筛选时，才可以调用 setReportFilter 设置 secondaryCategory，并传入 secondaryConfirmedByUser=true，然后调用 loadReports。",
+        nextStep: "如果用户已经明确确认要按某个二级方向筛选，且该二级值出现在 secondaryOptions 中，可以调用 setReportFilter 设置 secondaryCategory，并传入 secondaryConfirmedByUser=true，然后调用 loadReports。",
       };
     },
   });
@@ -551,8 +731,12 @@ export default function App() {
         return `二级筛选「${params.secondaryCategory}」不能直接确认。请先向用户追问是否按该二级方向筛选；用户确认后，再请求二级候选项并传 secondaryConfirmedByUser=true。`;
       }
 
-      // 一级分类变化后，旧二级分类通常已经不属于新的一级分类，先归回“全部”。
-      if (params.primaryCategory && params.primaryCategory !== filterRef.current.primaryCategory) {
+      // 一级分类变化后，旧二级分类通常已经不属于新的一级分类；但如果本次同时传入了已确认且合法的新二级值，应保留它。
+      if (
+        params.primaryCategory &&
+        params.primaryCategory !== filterRef.current.primaryCategory &&
+        (!params.secondaryCategory || params.secondaryCategory === "全部")
+      ) {
         secondaryCategory = "全部";
       }
 
@@ -797,6 +981,34 @@ export default function App() {
     return filter.direction === "asc" ? " ↑" : " ↓";
   }
 
+  function approveCandidateFromPanel(candidateId) {
+    updateKnowledgeBase(
+      (current) => approveRuleCandidate(current, candidateId),
+      `界面批准系统规则：${candidateId}`,
+      { candidateId },
+    );
+  }
+
+  function dismissCandidateFromPanel(candidateId) {
+    updateKnowledgeBase(
+      (current) => dismissRuleCandidate(current, candidateId),
+      `界面驳回系统规则候选：${candidateId}`,
+      { candidateId },
+    );
+  }
+
+  function resetLearningPanel() {
+    const next = resetKnowledgeBase();
+    knowledgeBaseRef.current = next;
+    setKnowledgeBase(next);
+    pushActivity("重置用户记忆与规则库", {
+      actor: "user",
+      type: "resetLearningMemory",
+      status: "completed",
+      payload: { approvedRules: next.systemRules.approved.length },
+    });
+  }
+
   return (
     <div className="app-shell">
       <div className="workspace">
@@ -808,19 +1020,39 @@ export default function App() {
           <span className="runtime-pill">AG-UI Runtime</span>
         </div>
 
-        {canInterrupt && (
-          <section className="interrupt-strip" aria-live="polite">
-            <div>
-              <strong>{agent.isRunning ? "AI 正在执行" : "操作执行中"}</strong>
-              <span>{activeOperation?.label || "等待模型响应或工具返回"}</span>
-            </div>
-            <button type="button" onClick={interruptCurrentOperation}>
-              打断当前操作
-            </button>
-          </section>
-        )}
+        <nav className="page-tabs" aria-label="页面切换">
+          <button
+            type="button"
+            className={activeTab === "workbench" ? "active" : ""}
+            onClick={() => setActiveTab("workbench")}
+          >
+            研报工作台
+          </button>
+          <button
+            type="button"
+            className={activeTab === "learning" ? "active" : ""}
+            onClick={() => setActiveTab("learning")}
+          >
+            知识沉淀
+            <span>{knowledgeBase.systemRules.candidates.length}</span>
+          </button>
+        </nav>
 
-        <section className={`toolbar toolbar-advanced ${showSecondaryFilter ? "has-secondary" : "no-secondary"}`}>
+        {activeTab === "workbench" && (
+          <>
+            {canInterrupt && (
+              <section className="interrupt-strip" aria-live="polite">
+                <div>
+                  <strong>{agent.isRunning ? "AI 正在执行" : "操作执行中"}</strong>
+                  <span>{activeOperation?.label || "等待模型响应或工具返回"}</span>
+                </div>
+                <button type="button" onClick={interruptCurrentOperation}>
+                  打断当前操作
+                </button>
+              </section>
+            )}
+
+            <section className={`toolbar toolbar-advanced ${showSecondaryFilter ? "has-secondary" : "no-secondary"}`}>
           <label className="filter-keyword">
             关键词
             <input
@@ -945,9 +1177,9 @@ export default function App() {
               {loading ? "加载中" : "加载"}
             </button>
           </div>
-        </section>
+            </section>
 
-        <section className="status-strip">
+            <section className="status-strip">
           <div>
             <strong>{pagination.total}</strong>
             <span>匹配研报</span>
@@ -964,9 +1196,9 @@ export default function App() {
             <strong>{filter.primaryCategory}</strong>
             <span>{secondaryLoading ? "二级加载中" : filter.secondaryCategory}</span>
           </div>
-        </section>
+            </section>
 
-        <main className="content-grid">
+            <main className="content-grid">
           <section className="table-wrap">
             {loading ? (
               <div className="loading-box">正在加载研报数据...</div>
@@ -1084,14 +1316,71 @@ export default function App() {
               <p className="muted">尚未打开研报。可以让 Copilot “打开第一篇报告详情”。</p>
             )}
           </section>
-        </main>
+            </main>
 
-        <section className="activity-log">
-          <h2>动作审计</h2>
-          {activity.map((item, index) => (
-            <div key={`${item}-${index}`}>{item}</div>
-          ))}
-        </section>
+            <section className="activity-log">
+              <h2>动作审计</h2>
+              {activity.map((item, index) => (
+                <div key={`${item}-${index}`}>{item}</div>
+              ))}
+            </section>
+          </>
+        )}
+
+        {activeTab === "learning" && (
+          <section className="learning-panel">
+          <div className="section-title-row">
+            <div>
+              <h2>知识沉淀</h2>
+              <p>用户记忆影响当前用户；已批准系统规则才会作为通用规则进入 Copilot 上下文。</p>
+            </div>
+            <button type="button" className="ghost-button" onClick={resetLearningPanel}>
+              重置
+            </button>
+          </div>
+
+          <div className="learning-grid">
+            <article>
+              <strong>用户记忆</strong>
+              <span>
+                {knowledgeBase.userMemory.preferences.length + knowledgeBase.userMemory.corrections.length + knowledgeBase.userMemory.habits.length} 条
+              </span>
+              {[...knowledgeBase.userMemory.preferences, ...knowledgeBase.userMemory.corrections, ...knowledgeBase.userMemory.habits]
+                .slice(0, 4)
+                .map((item) => (
+                  <p key={item.id}>{item.value}</p>
+                ))}
+            </article>
+
+            <article>
+              <strong>已生效系统规则</strong>
+              <span>{knowledgeBase.systemRules.approved.length} 条</span>
+              {knowledgeBase.systemRules.approved.slice(0, 4).map((item) => (
+                <p key={item.id}>{item.abstractRule}</p>
+              ))}
+            </article>
+
+            <article>
+              <strong>待审核规则</strong>
+              <span>{knowledgeBase.systemRules.candidates.length} 条</span>
+              {knowledgeBase.systemRules.candidates.slice(0, 3).map((item) => (
+                <div className="candidate-rule" key={item.id}>
+                  <p>{item.abstractRule}</p>
+                  <div>
+                    <button type="button" onClick={() => approveCandidateFromPanel(item.id)}>
+                      批准
+                    </button>
+                    <button type="button" onClick={() => dismissCandidateFromPanel(item.id)}>
+                      驳回
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {knowledgeBase.systemRules.candidates.length === 0 && <p>暂无待审核规则。</p>}
+            </article>
+          </div>
+          </section>
+        )}
       </div>
 
       {copilotStarted ? (

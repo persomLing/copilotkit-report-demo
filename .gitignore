@@ -4,3 +4,4 @@ dist/
 npm-debug.log*
 Dockerfile.local
 docs/React项目AI化技术方案与旧项目审计模板.md
+docs/使用教程.md
